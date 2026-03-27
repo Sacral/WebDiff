@@ -11,7 +11,9 @@ Features
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+import collections
 import datetime as dt
 import difflib
 import hashlib
@@ -25,18 +27,18 @@ from pathlib import Path
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial
 from threading import Thread
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
 try:
-    from playwright.sync_api import Error as PlaywrightError
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import async_playwright
 
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
@@ -280,57 +282,436 @@ def _save_image_preview(image_path: Path, output_path: Path) -> None:
     shutil.copy2(image_path, output_path)
 
 
+def _crop_trailing_whitespace(
+    img: "Image.Image",
+    bg_threshold: int = 245,
+    min_height: int = 200,
+    bottom_pad: int = 30,
+) -> "Image.Image":
+    """Crop near-white rows from the bottom of a screenshot.
+
+    Samples every 8th pixel per row for performance.  Rows where every sampled
+    pixel is lighter than *bg_threshold* (grayscale) are considered blank.
+    At least *min_height* pixels are always kept, and *bottom_pad* pixels of
+    padding are added below the last detected content row.
+    """
+    if not PIL_AVAILABLE:
+        return img
+    w, h = img.size
+    if h <= min_height:
+        return img
+    gray = img.convert("L")
+    pixels = gray.load()
+    step = max(1, w // 128)  # ~128 sample points per row
+    last_content = min_height - 1
+    for y in range(h - 1, min_height - 1, -1):
+        if any(pixels[x, y] < bg_threshold for x in range(0, w, step)):
+            last_content = y
+            break
+    new_h = min(h, last_content + 1 + bottom_pad)
+    if new_h >= h - 10:
+        return img
+    return img.crop((0, 0, w, new_h))
+
+
+def _build_diff_boxes(mask: "Image.Image") -> List[Tuple[int, int, int, int]]:
+    width, height = mask.size
+    if width <= 0 or height <= 0:
+        return []
+
+    # Smooth tiny gaps/noise first so connected components are more stable.
+    normalized = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    pixels = normalized.load()
+    visited = bytearray(width * height)
+    boxes: List[Tuple[int, int, int, int]] = []
+    min_pixels = 50   # ignore tiny noise clusters (< 50 changed pixels)
+    padding = 3
+
+    for y in range(height):
+        row_base = y * width
+        for x in range(width):
+            idx = row_base + x
+            if visited[idx] or pixels[x, y] == 0:
+                continue
+
+            queue = collections.deque([(x, y)])
+            visited[idx] = 1
+            min_x = max_x = x
+            min_y = max_y = y
+            area = 0
+
+            while queue:
+                cx, cy = queue.popleft()
+                area += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+
+                for ny in (cy - 1, cy, cy + 1):
+                    if ny < 0 or ny >= height:
+                        continue
+                    nrow = ny * width
+                    for nx in (cx - 1, cx, cx + 1):
+                        if nx < 0 or nx >= width or (nx == cx and ny == cy):
+                            continue
+                        nidx = nrow + nx
+                        if visited[nidx] or pixels[nx, ny] == 0:
+                            continue
+                        visited[nidx] = 1
+                        queue.append((nx, ny))
+
+            if area < min_pixels:
+                continue
+
+            boxes.append(
+                (
+                    max(0, min_x - padding),
+                    max(0, min_y - padding),
+                    min(width, max_x + 1 + padding),
+                    min(height, max_y + 1 + padding),
+                )
+            )
+
+    # Merge overlapping/nearby boxes so one changed block gets one marker.
+    merge_gap = 6
+    merged = sorted(boxes)
+    changed = True
+    while changed:
+        changed = False
+        next_boxes: List[Tuple[int, int, int, int]] = []
+        while merged:
+            left, top, right, bottom = merged.pop(0)
+            i = 0
+            while i < len(merged):
+                l2, t2, r2, b2 = merged[i]
+                separated = (
+                    right + merge_gap < l2
+                    or r2 + merge_gap < left
+                    or bottom + merge_gap < t2
+                    or b2 + merge_gap < top
+                )
+                if separated:
+                    i += 1
+                    continue
+                left = min(left, l2)
+                top = min(top, t2)
+                right = max(right, r2)
+                bottom = max(bottom, b2)
+                merged.pop(i)
+                changed = True
+            next_boxes.append((left, top, right, bottom))
+        merged = sorted(next_boxes)
+
+    return merged
+
+
+def _merge_rect_list(
+    rects: List[Tuple[int, int, int, int]],
+    gap: int = 8,
+) -> List[Tuple[int, int, int, int]]:
+    """Merge a flat list of rectangles that overlap or are closer than *gap* pixels."""
+    if not rects:
+        return []
+    merged = sorted(rects)
+    changed = True
+    while changed:
+        changed = False
+        next_rects: List[Tuple[int, int, int, int]] = []
+        while merged:
+            left, top, right, bottom = merged.pop(0)
+            i = 0
+            while i < len(merged):
+                l2, t2, r2, b2 = merged[i]
+                if right + gap >= l2 and r2 + gap >= left and bottom + gap >= t2 and b2 + gap >= top:
+                    left = min(left, l2)
+                    top = min(top, t2)
+                    right = max(right, r2)
+                    bottom = max(bottom, b2)
+                    merged.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            next_rects.append((left, top, right, bottom))
+        merged = sorted(next_rects)
+    return merged
+
+
+def _expand_to_sections(
+    boxes: List[Tuple[int, int, int, int]],
+    all_text_regions: List[Tuple[str, Tuple[int, int, int, int]]],
+    v_gap: int = 40,
+) -> List[Tuple[int, int, int, int]]:
+    """Flood-fill expand each box to cover the entire visual section it belongs to.
+
+    Starting from a tight box around a detected new/deleted text token, this
+    iteratively expands the box to absorb any text region that:
+      - shares direct horizontal overlap with the current box (same column), AND
+      - lies within *v_gap* pixels vertically (adjacent line or paragraph).
+
+    Because every line in a section is within ~25 px of the next line, the fill
+    naturally flows through all items in the section.  The fill stops when it
+    reaches the inter-section whitespace (typically ≥ 40 px).
+
+    This solves the problem where a section heading is detected as new but its
+    list items exist elsewhere in the old page: the heading box expands to cover
+    the full section regardless of whether individual items are "new" or not.
+    """
+    if not boxes:
+        return boxes
+    all_rects = [(nl, nt, nr, nb) for _, (nl, nt, nr, nb) in all_text_regions]
+    result: List[Tuple[int, int, int, int]] = []
+    for bl, bt, br, bb in boxes:
+        changed = True
+        while changed:
+            changed = False
+            for nl, nt, nr, nb in all_rects:
+                if nr <= bl or nl >= br:          # no horizontal overlap
+                    continue
+                if nt > bb + v_gap or nb < bt - v_gap:   # too far vertically
+                    continue
+                new_box = (min(bl, nl), min(bt, nt), max(br, nr), max(bb, nb))
+                if new_box != (bl, bt, br, bb):
+                    bl, bt, br, bb = new_box
+                    changed = True
+        result.append((bl, bt, br, bb))
+    return _merge_rect_list(result, gap=10)
+
+
+def _filter_moved_boxes(
+    boxes: List[Tuple[int, int, int, int]],
+    new_text_regions: List[Tuple[str, Tuple[int, int, int, int]]],
+    old_texts: Set[str],
+) -> List[Tuple[int, int, int, int]]:
+    """Remove diff boxes from the *new* image whose text content all exists in old.
+
+    A box whose every detected text element is present somewhere in the old page is
+    treated as "content that merely moved" rather than genuinely new content, and is
+    therefore suppressed.  Boxes with no detectable text (image/colour changes) and
+    boxes containing at least one brand-new text token are kept.
+    """
+    result: List[Tuple[int, int, int, int]] = []
+    for bl, bt, br, bb in boxes:
+        texts_in_box: Set[str] = set()
+        for text, (tl, tt, tr, tb) in new_text_regions:
+            if tr > bl and br > tl and tb > bt and bb > tt:
+                texts_in_box.add(text)
+        if not texts_in_box:
+            result.append((bl, bt, br, bb))
+        elif all(t in old_texts for t in texts_in_box):
+            pass  # all content existed in old → moved, not new
+        else:
+            result.append((bl, bt, br, bb))
+    return result
+
+
+def _build_deleted_text_boxes(
+    old_text_regions: List[Tuple[str, Tuple[int, int, int, int]]],
+    new_text_regions: List[Tuple[str, Tuple[int, int, int, int]]],
+    pad: int = 4,
+) -> List[Tuple[int, int, int, int]]:
+    """Return merged bounding boxes in the *old* image for text absent from the new page."""
+    new_texts: Set[str] = {text for text, _ in new_text_regions}
+    raw: List[Tuple[int, int, int, int]] = []
+    for text, (tl, tt, tr, tb) in old_text_regions:
+        if text not in new_texts:
+            raw.append((max(0, tl - pad), max(0, tt - pad), tr + pad, tb + pad))
+    return _merge_rect_list(raw)
+
+
 def _save_image_diff(
     old_path: Path,
     new_path: Path,
-    diff_overlay_path: Path,
+    new_overlay_path: Path,
+    old_overlay_path: Optional[Path] = None,
+    old_text_regions: Optional[List[Tuple[str, Tuple[int, int, int, int]]]] = None,
+    new_text_regions: Optional[List[Tuple[str, Tuple[int, int, int, int]]]] = None,
 ) -> Optional[Dict[str, object]]:
+    """Generate annotated overlay images for the visual page diff.
+
+    new_overlay_path – new screenshot with **orange** boxes around genuinely
+        new or changed areas (content that only moved is suppressed).
+    old_overlay_path – old screenshot with **red** boxes around text regions
+        that were deleted (absent from the new page).  Only written when the
+        parameter is supplied and text-region data is available.
+    """
     if not PIL_AVAILABLE:
         return None
 
-    old_img = Image.open(old_path).convert("RGBA")
-    new_img = Image.open(new_path).convert("RGBA")
+    # Crop trailing whitespace so oversized empty canvases don't dominate.
+    old_img = _crop_trailing_whitespace(Image.open(old_path).convert("RGBA"))
+    new_img = _crop_trailing_whitespace(Image.open(new_path).convert("RGBA"))
 
-    if old_img.size != new_img.size:
-        return {
-            "same_size": False,
-            "size_old": old_img.size,
-            "size_new": new_img.size,
-            "changed_ratio": 1.0,
-        }
+    old_w, old_h = old_img.size
+    new_w, new_h = new_img.size
+    common_w = min(old_w, new_w)
+    common_h = min(old_h, new_h)
 
-    diff = ImageChops.difference(old_img, new_img)
+    # Pixel diff is kept only for summary METRICS (mean_delta, changed_ratio).
+    # It is NOT used to determine visual annotation boxes, because page-level
+    # layout shifts (sidebar additions, inserted sections) cause pixel differences
+    # throughout even when content is identical, making pixel-diff boxes
+    # misleading and overwhelming.
+    compare_old_b = old_img.crop((0, 0, common_w, common_h)).filter(ImageFilter.GaussianBlur(radius=1))
+    compare_new_b = new_img.crop((0, 0, common_w, common_h)).filter(ImageFilter.GaussianBlur(radius=1))
+    diff = ImageChops.difference(compare_old_b, compare_new_b)
     stat = ImageStat.Stat(diff)
-    total_pixels = old_img.size[0] * old_img.size[1]
-
-    # Mean value range per channel is 0..255.
+    total_pixels = common_w * common_h
     mean_delta = sum(stat.mean[:3]) / 3.0
-
-    diff_mask = diff.convert("L")
-    hist = diff_mask.histogram()
+    diff_luma = diff.convert("L")
+    hist = diff_luma.histogram()
     non_zero = total_pixels - (hist[0] if hist else 0)
     changed_ratio = non_zero / max(1, total_pixels)
 
-    # Highlight changed pixels in red over new image.
-    mask = diff.convert("L").point(lambda x: 255 if x > 10 else 0)
-    overlay = new_img.copy()
-    red_layer = Image.new("RGBA", new_img.size, (255, 0, 0, 150))
-    overlay.paste(red_layer, (0, 0), mask)
+    old_regions_list: List[Tuple[str, Tuple[int, int, int, int]]] = old_text_regions or []
+    new_regions_list: List[Tuple[str, Tuple[int, int, int, int]]] = new_text_regions or []
 
-    diff_overlay_path.parent.mkdir(parents=True, exist_ok=True)
-    overlay.save(diff_overlay_path)
+    # Text-content matching uses tokens of ≥ 3 characters.  Chinese characters
+    # are each individually meaningful so 3 chars is a useful minimum; it also
+    # filters out pure punctuation, bullet numbers ("1.", "▶"), etc.
+    MIN_LEN = 3
+
+    old_texts_set: Set[str] = {t for t, _ in old_regions_list if len(t) >= MIN_LEN}
+    new_texts_set: Set[str] = {t for t, _ in new_regions_list if len(t) >= MIN_LEN}
+
+    # ── New content boxes (new image) ────────────────────────────────────────
+    # Primary method: TEXT-BASED DIFF.
+    # A text token / block present in new but absent from old is genuinely new
+    # content regardless of its position on the page.  Boxes are drawn around
+    # those regions; everything that also exists in old is ignored.
+    # Fallback: pixel diff, used only when Playwright text extraction returned
+    # no data (e.g. the page was not loaded, JS execution failed, etc.).
+    if old_texts_set and new_texts_set:
+        new_raw: List[Tuple[int, int, int, int]] = [
+            (nl, nt, nr, nb)
+            for text, (nl, nt, nr, nb) in new_regions_list
+            if len(text) >= MIN_LEN and text not in old_texts_set
+        ]
+        # Each entry in new_raw already carries the section-container bounding
+        # box (from _TEXT_REGION_JS getSectionRect), so a moderate merge gap is
+        # sufficient to combine overlapping container boxes without chaining
+        # through the whole page.
+        new_boxes = _merge_rect_list(new_raw, gap=60)
+    else:
+        # Pixel-diff fallback.
+        mask = diff_luma.point(lambda x: 255 if x > 25 else 0)
+        new_boxes = _build_diff_boxes(mask)
+
+    # ── Deleted content boxes (old image) ────────────────────────────────────
+    if old_texts_set and new_texts_set:
+        del_raw: List[Tuple[int, int, int, int]] = [
+            (ol, ot, or_, ob)
+            for text, (ol, ot, or_, ob) in old_regions_list
+            if len(text) >= MIN_LEN and text not in new_texts_set
+        ]
+        deleted_boxes = _merge_rect_list(del_raw, gap=60)
+    else:
+        deleted_boxes = []
+
+    # Regions that exist only in old or only in new due to page-height mismatch.
+    old_extra_regions: List[Tuple[int, int, int, int]] = []
+    new_extra_regions: List[Tuple[int, int, int, int]] = []
+    if old_w > common_w:
+        old_extra_regions.append((common_w, 0, old_w, old_h))
+    if old_h > common_h:
+        old_extra_regions.append((0, common_h, old_w, old_h))
+    if new_w > common_w:
+        new_extra_regions.append((common_w, 0, new_w, new_h))
+    if new_h > common_h:
+        new_extra_regions.append((0, common_h, new_w, new_h))
+
+    canvas_w = max(old_w, new_w)
+    canvas_h = max(old_h, new_h)
+
+    def _draw_annotated(
+        base: "Image.Image",
+        boxes: List[Tuple[int, int, int, int]],
+        fill_rgba: Tuple[int, int, int, int],
+        outline_rgb: Tuple[int, int, int],
+        extra_regions: List[Tuple[int, int, int, int]],
+        extra_fill_rgba: Tuple[int, int, int, int],
+        extra_outline_rgb: Tuple[int, int, int],
+    ) -> "Image.Image":
+        """Composite semi-transparent fills + opaque outlines onto *base*.
+
+        PIL's ImageDraw does not alpha-blend fills; we draw on a separate
+        transparent layer then alpha_composite so underlying text stays readable.
+        """
+        w, h = base.size
+        fill_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        fd = ImageDraw.Draw(fill_layer)
+        for l, t, r, b in boxes:
+            fd.rectangle((l, t, r, b), fill=fill_rgba)
+        for l, t, r, b in extra_regions:
+            fd.rectangle((l, t, r, b), fill=extra_fill_rgba)
+        result = Image.alpha_composite(base, fill_layer)
+        od = ImageDraw.Draw(result)
+        for l, t, r, b in boxes:
+            od.rectangle((l, t, r, b), outline=outline_rgb + (255,), width=3)
+        for l, t, r, b in extra_regions:
+            od.rectangle((l, t, r, b), outline=extra_outline_rgb + (200,), width=2)
+        return result
+
+    # ── Draw new-image overlay (orange = new content) ────────────────────────
+    new_base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
+    new_base.paste(new_img, (0, 0))
+    new_overlay = _draw_annotated(
+        new_base,
+        boxes=new_boxes,
+        fill_rgba=(249, 115, 22, 60),
+        outline_rgb=(234, 88, 12),
+        extra_regions=new_extra_regions,
+        extra_fill_rgba=(249, 115, 22, 40),
+        extra_outline_rgb=(234, 88, 12),
+    )
+    new_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+    new_overlay.save(new_overlay_path)
+
+    # ── Draw old-image overlay (red = deleted content) ───────────────────────
+    if old_overlay_path is not None:
+        old_base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
+        old_base.paste(old_img, (0, 0))
+        old_overlay_img = _draw_annotated(
+            old_base,
+            boxes=deleted_boxes,
+            fill_rgba=(220, 38, 38, 60),
+            outline_rgb=(220, 38, 38),
+            extra_regions=old_extra_regions,
+            extra_fill_rgba=(59, 130, 246, 40),
+            extra_outline_rgb=(37, 99, 235),
+        )
+        old_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        old_overlay_img.save(old_overlay_path)
 
     return {
-        "same_size": True,
+        "same_size": old_img.size == new_img.size,
         "size_old": old_img.size,
         "size_new": new_img.size,
+        "compare_region": (common_w, common_h),
         "mean_delta": round(mean_delta, 3),
         "changed_ratio": round(changed_ratio, 6),
+        "box_count": len(new_boxes),
+        "deleted_box_count": len(deleted_boxes),
+        "old_extra_regions": old_extra_regions,
+        "new_extra_regions": new_extra_regions,
+        "text_based": bool(old_texts_set and new_texts_set),
+        "note": (
+            "Text-content diff: boxes show only genuinely new / deleted text tokens."
+            if old_texts_set and new_texts_set
+            else "Pixel diff fallback (text extraction unavailable)."
+        ),
     }
 
 
 def _safe_anchor(value: str) -> str:
     return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _asset_src(path_value: str, cache_token: str) -> str:
+    quoted_token = urllib.parse.quote(cache_token, safe="")
+    safe_path = html.escape(path_value)
+    sep = "&" if "?" in path_value else "?"
+    return f"{safe_path}{sep}v={quoted_token}"
 
 
 class ProgressBar:
@@ -403,6 +784,473 @@ class LocalSnapshotServer:
         self.thread.join(timeout=2.0)
 
 
+_TEXT_REGION_JS = """() => {
+    const out = [];
+    const seen = new Set();
+
+    function isHidden(el) {
+        const s = window.getComputedStyle(el);
+        return s.display === "none" || s.visibility === "hidden" || Number(s.opacity || "1") === 0;
+    }
+
+    // Pass 1: text nodes (2–100 chars) — fine-grained tokens for matching.
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+        const text = (node.textContent || "").replace(/\\s+/g, " ").trim();
+        if (!text || text.length < 2 || text.length > 100) {
+            node = walker.nextNode();
+            continue;
+        }
+        const parent = node.parentElement;
+        if (!parent || isHidden(parent)) {
+            node = walker.nextNode();
+            continue;
+        }
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const rect = range.getBoundingClientRect();
+        if (!rect || rect.width < 10 || rect.height < 6) {
+            node = walker.nextNode();
+            continue;
+        }
+        const key = text + "|" + Math.round(rect.left) + "|" + Math.round(rect.top);
+        if (!seen.has(key)) {
+            seen.add(key);
+            out.push({
+                text,
+                left: Math.round(rect.left),
+                top: Math.round(rect.top),
+                right: Math.round(rect.right),
+                bottom: Math.round(rect.bottom),
+            });
+        }
+        node = walker.nextNode();
+    }
+
+    // Pass 2: block-level elements — use first 120 chars as fingerprint,
+    // element bounding box covers the full rendered area for stable suppression.
+    const BLOCK_TAGS = ["p","li","h1","h2","h3","h4","h5","h6","td","th","dt","dd","figcaption"];
+    for (const tag of BLOCK_TAGS) {
+        for (const el of document.querySelectorAll(tag)) {
+            if (isHidden(el)) continue;
+            const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+            if (!text || text.length < 4) continue;
+            const fingerprint = text.slice(0, 120);
+            const rect = el.getBoundingClientRect();
+            if (!rect || rect.width < 20 || rect.height < 8) continue;
+            const key = fingerprint + "|blk|" + Math.round(rect.left) + "|" + Math.round(rect.top);
+            if (!seen.has(key)) {
+                seen.add(key);
+                out.push({
+                    text: fingerprint,
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                    right: Math.round(rect.right),
+                    bottom: Math.round(rect.bottom),
+                });
+            }
+        }
+    }
+
+    // Pass 3: section-level container elements (div / section / article / aside).
+    // Uses the container's *full* text content (first 120 chars) as a fingerprint
+    // and the container's bounding box as the visual region.  This is the key
+    // mechanism for highlighting an entire logical section (e.g. a note block
+    // with heading + list items) as a single box: if the container's content
+    // fingerprint is absent from the old page, the whole container gets boxed.
+    //
+    // Height range 20–800 px: lower bound 20 px captures single-line heading
+    // widgets (Axure text rectangles are typically 25 px tall) while still
+    // filtering sub-pixel wrappers; upper bound 800 px excludes page-level divs.
+    for (const el of document.querySelectorAll("div, section, article, aside")) {
+        if (isHidden(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.height < 20 || rect.height > 800 || rect.width < 80) continue;
+        const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+        if (text.length < 10) continue;
+        const fingerprint = text.slice(0, 120);
+        const key = "cnt|" + fingerprint;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+            text: fingerprint,
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+            right: Math.round(rect.right),
+            bottom: Math.round(rect.bottom),
+        });
+    }
+
+    return out;
+}"""
+
+
+def _parse_text_regions(raw_regions: List[Dict[str, Any]]) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+    regions: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    for item in raw_regions:
+        text = str(item.get("text", "")).strip()
+        left = int(item.get("left", 0))
+        top = int(item.get("top", 0))
+        right = int(item.get("right", 0))
+        bottom = int(item.get("bottom", 0))
+        if not text or right <= left or bottom <= top:
+            continue
+        regions.append((text, (left, top, right, bottom)))
+    return regions
+
+
+async def _extract_text_regions_async(page) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+    try:
+        raw_regions: List[Dict[str, Any]] = await page.evaluate(_TEXT_REGION_JS)
+    except Exception:
+        return []
+    return _parse_text_regions(raw_regions)
+
+
+async def _unlock_full_page(page) -> None:
+    """Ensure Playwright captures the full page, including sidebar-heavy layouts.
+
+    Two-pass approach:
+    1. Inject CSS to remove overflow/height restrictions on <html> and <body> so
+       the true scrollHeight becomes visible.
+    2. Read the resulting scrollHeight and resize the viewport to that height.
+       This causes elements sized with 100vh (e.g. fixed sidebars) to expand to
+       the full content height, revealing all menu items.
+    A final requestAnimationFrame waits for the layout to settle before the
+    caller takes the screenshot.  The changes are in-memory only.
+    """
+    try:
+        await page.add_style_tag(content=(
+            "html, body {"
+            "  overflow: visible !important;"
+            "  height: auto !important;"
+            "  max-height: none !important;"
+            "}"
+        ))
+        await page.evaluate("() => new Promise(r => requestAnimationFrame(r))")
+
+        # Measure the true content height after the overflow fix.
+        dims = await page.evaluate("""() => ({
+            w: window.innerWidth,
+            h: Math.max(
+                document.documentElement.scrollHeight,
+                document.body ? document.body.scrollHeight : 0
+            )
+        })""")
+        w = int(dims.get("w") or 0)
+        h = int(dims.get("h") or 0)
+        # Resize viewport so that 100vh / height:100% elements expand fully.
+        if w > 0 and h > 0:
+            await page.set_viewport_size({"width": w, "height": h})
+            await page.evaluate("() => new Promise(r => requestAnimationFrame(r))")
+    except Exception:
+        pass
+
+
+def _build_stable_text_regions(
+    old_regions: Sequence[Tuple[str, Tuple[int, int, int, int]]],
+    new_regions: Sequence[Tuple[str, Tuple[int, int, int, int]]],
+) -> List[Tuple[int, int, int, int]]:
+    old_by_text: Dict[str, List[Tuple[int, int, int, int]]] = {}
+    new_by_text: Dict[str, List[Tuple[int, int, int, int]]] = {}
+    for text, box in old_regions:
+        old_by_text.setdefault(text, []).append(box)
+    for text, box in new_regions:
+        new_by_text.setdefault(text, []).append(box)
+
+    stable: List[Tuple[int, int, int, int]] = []
+    for text in set(old_by_text) & set(new_by_text):
+        old_boxes = old_by_text[text]
+        candidates = new_by_text[text]
+        used: Set[int] = set()
+        for old_box in old_boxes:
+            ol, ot, or_, ob = old_box
+            ow, oh = or_ - ol, ob - ot
+            ocx = (ol + or_) / 2.0
+            ocy = (ot + ob) / 2.0
+            best_idx: Optional[int] = None
+            best_score = float("inf")
+            for idx, new_box in enumerate(candidates):
+                if idx in used:
+                    continue
+                nl, nt, nr, nb = new_box
+                nw, nh = nr - nl, nb - nt
+                ncx = (nl + nr) / 2.0
+                ncy = (nt + nb) / 2.0
+                # Element size must be reasonably similar; large tolerance for
+                # containers that reflow when neighbouring content changes.
+                if abs(ow - nw) > 100 or abs(oh - nh) > 60:
+                    continue
+                # X-center tolerance covers sidebar-width changes that push the
+                # main content column horizontally (up to ~100 px shift).
+                if abs(ocx - ncx) > 100:
+                    continue
+                # Y may differ significantly when items are pushed down by insertions.
+                # Use a balanced score so both axes matter equally.
+                score = abs(ocx - ncx) * 2 + abs(ow - nw) + abs(oh - nh) + abs(ocy - ncy) * 0.05
+                if score < best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx is None:
+                continue
+            used.add(best_idx)
+            # Use new-image coordinates so suppression applies to the rendered new page.
+            nl, nt, nr, nb = candidates[best_idx]
+            # Small padding to cover anti-aliased edges of the element.
+            pad = 4
+            stable.append((max(0, nl - pad), max(0, nt - pad), nr + pad, nb + pad))
+
+    stable = [box for box in stable if (box[2] - box[0]) >= 10 and (box[3] - box[1]) >= 6]
+    return stable[:800]
+
+
+async def _page_visual_diffs_async(
+    old_root: Path,
+    new_root: Path,
+    output_dir: Path,
+    candidates: List[str],
+    new_only: List[str],
+    viewport_width: int,
+    viewport_height: int,
+    wait_ms: int,
+    progress: "ProgressBar",
+    stats: Dict[str, int],
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    items: List[Dict[str, object]] = []
+    warning: Optional[str] = None
+
+    old_server = LocalSnapshotServer(old_root)
+    new_server = LocalSnapshotServer(new_root)
+    old_server.start()
+    new_server.start()
+
+    try:
+        async with async_playwright() as p:
+            browser = None
+            try:
+                browser = await p.chromium.launch(headless=True)
+            except PlaywrightError as exc:
+                if "Executable doesn't exist" not in str(exc):
+                    raise
+                for channel in ("msedge", "chrome"):
+                    try:
+                        browser = await p.chromium.launch(headless=True, channel=channel)
+                        break
+                    except PlaywrightError:
+                        continue
+            if browser is None:
+                warning = (
+                    "Playwright browser is missing. Install with "
+                    "`python -m playwright install chromium`, or ensure Edge/Chrome is installed."
+                )
+                return items, warning
+
+            context = await browser.new_context(
+                viewport={"width": max(200, viewport_width), "height": max(200, viewport_height)},
+                ignore_https_errors=True,
+            )
+            # Two pages so old and new can load simultaneously.
+            old_page = await context.new_page()
+            new_page = await context.new_page()
+
+            old_rel_ref: Dict[str, Optional[str]] = {"value": None}
+            new_rel_ref: Dict[str, Optional[str]] = {"value": None}
+            per_page_http_errors: Dict[str, Dict[str, object]] = {}
+
+            async def _track_response(response, rel_ref: Dict[str, Optional[str]]) -> None:
+                rel = rel_ref.get("value")
+                if not rel:
+                    return
+                try:
+                    status = int(response.status)
+                except Exception:
+                    return
+                if status < 400:
+                    return
+                record = per_page_http_errors.setdefault(rel, {"count": 0, "samples": []})
+                record["count"] = int(record.get("count", 0)) + 1
+                samples = record.get("samples")
+                if isinstance(samples, list) and len(samples) < 5:
+                    samples.append(f"[{status}] {response.url}")
+
+            old_page.on("response", lambda r: asyncio.ensure_future(_track_response(r, old_rel_ref)))
+            new_page.on("response", lambda r: asyncio.ensure_future(_track_response(r, new_rel_ref)))
+
+            loop = asyncio.get_event_loop()
+
+            for rel in candidates:
+                try:
+                    old_rel_ref["value"] = rel
+                    new_rel_ref["value"] = rel
+                    quoted_rel = urllib.parse.quote(rel, safe="/")
+                    old_url = f"http://127.0.0.1:{old_server.port}/{quoted_rel}"
+                    new_url = f"http://127.0.0.1:{new_server.port}/{quoted_rel}"
+                    anchor = _safe_anchor(f"page::{rel}")
+                    old_preview = Path("assets") / f"{anchor}_page_old.png"
+                    new_preview = Path("assets") / f"{anchor}_page_new.png"
+                    overlay_preview = Path("assets") / f"{anchor}_page_overlay.png"
+                    old_overlay_preview = Path("assets") / f"{anchor}_page_old_overlay.png"
+
+                    # Navigate both pages in parallel.
+                    await asyncio.gather(
+                        old_page.goto(old_url, wait_until="load", timeout=60000),
+                        new_page.goto(new_url, wait_until="load", timeout=60000),
+                    )
+                    if wait_ms > 0:
+                        await asyncio.gather(
+                            old_page.wait_for_timeout(wait_ms),
+                            new_page.wait_for_timeout(wait_ms),
+                        )
+
+                    # Unlock overflow and resize viewport to content height FIRST so
+                    # that 100vh sidebars expand fully.  Text region coordinates are
+                    # then extracted from the already-expanded layout, keeping them
+                    # consistent with what the screenshot will capture.
+                    await asyncio.gather(
+                        _unlock_full_page(old_page),
+                        _unlock_full_page(new_page),
+                    )
+
+                    # Extract text regions from both pages in parallel.
+                    old_text_regions, new_text_regions = await asyncio.gather(
+                        _extract_text_regions_async(old_page),
+                        _extract_text_regions_async(new_page),
+                    )
+
+                    # Screenshot both pages in parallel.
+                    await asyncio.gather(
+                        old_page.screenshot(path=str(output_dir / old_preview), full_page=True),
+                        new_page.screenshot(path=str(output_dir / new_preview), full_page=True),
+                    )
+
+                    stats["compared"] += 1
+                    old_hash, new_hash = await asyncio.gather(
+                        loop.run_in_executor(None, sha1_file, output_dir / old_preview),
+                        loop.run_in_executor(None, sha1_file, output_dir / new_preview),
+                    )
+
+                    error_info = per_page_http_errors.get(rel, {"count": 0, "samples": []})
+                    error_count = int(error_info.get("count", 0))
+                    error_samples = (
+                        error_info.get("samples", [])
+                        if isinstance(error_info.get("samples", []), list)
+                        else []
+                    )
+                    if error_count > 0:
+                        stats["http_error_pages"] += 1
+                        stats["http_error_requests"] += error_count
+
+                    if old_hash == new_hash:
+                        stats["skipped"] += 1
+                        continue
+
+                    metrics = await loop.run_in_executor(
+                        None,
+                        _save_image_diff,
+                        output_dir / old_preview,
+                        output_dir / new_preview,
+                        output_dir / overlay_preview,
+                        output_dir / old_overlay_preview,
+                        old_text_regions,
+                        new_text_regions,
+                    )
+
+                    # Skip pages where the image diff engine finds no visible changes.
+                    # Screenshot hashes can differ due to sub-pixel rendering noise even
+                    # when the page looks identical; only surface items with real boxes.
+                    # Pages whose length changed (new_extra_regions / old_extra_regions)
+                    # are always shown even when the overlapping region looks identical.
+                    if metrics is not None:
+                        has_boxes = (
+                            int(metrics.get("box_count", 0)) > 0
+                            or int(metrics.get("deleted_box_count", 0)) > 0
+                        )
+                        has_size_change = bool(
+                            metrics.get("new_extra_regions") or metrics.get("old_extra_regions")
+                        )
+                        if not has_boxes and not has_size_change:
+                            stats["skipped"] += 1
+                            continue
+
+                    stats["changed"] += 1
+                    items.append(
+                        {
+                            "path": rel,
+                            "old_hash": old_hash[:10],
+                            "new_hash": new_hash[:10],
+                            "old_preview": old_preview.as_posix(),
+                            "new_preview": new_preview.as_posix(),
+                            "overlay_preview": (
+                                overlay_preview.as_posix()
+                                if metrics and (output_dir / overlay_preview).exists()
+                                else ""
+                            ),
+                            "old_overlay_preview": (
+                                old_overlay_preview.as_posix()
+                                if metrics and (output_dir / old_overlay_preview).exists()
+                                else ""
+                            ),
+                            "metrics": metrics or {"note": "Pillow not installed; only screenshot compared."},
+                            "http_error_count": error_count,
+                            "http_error_samples": error_samples,
+                            "is_new_page": False,
+                        }
+                    )
+                except Exception:
+                    stats["skipped"] += 1
+                finally:
+                    old_rel_ref["value"] = None
+                    new_rel_ref["value"] = None
+                    progress.update()
+
+            # Render new-only pages (no old version to compare against).
+            for rel in new_only:
+                try:
+                    new_rel_ref["value"] = rel
+                    quoted_rel = urllib.parse.quote(rel, safe="/")
+                    new_url = f"http://127.0.0.1:{new_server.port}/{quoted_rel}"
+                    anchor = _safe_anchor(f"page::{rel}")
+                    new_preview = Path("assets") / f"{anchor}_page_new.png"
+
+                    await new_page.goto(new_url, wait_until="load", timeout=60000)
+                    if wait_ms > 0:
+                        await new_page.wait_for_timeout(wait_ms)
+                    await _unlock_full_page(new_page)
+                    await new_page.screenshot(path=str(output_dir / new_preview), full_page=True)
+
+                    new_hash = await loop.run_in_executor(None, sha1_file, output_dir / new_preview)
+                    stats["changed"] += 1
+                    items.append(
+                        {
+                            "path": rel,
+                            "old_hash": "",
+                            "new_hash": new_hash[:10],
+                            "old_preview": "",
+                            "new_preview": new_preview.as_posix(),
+                            "overlay_preview": "",
+                            "metrics": {"note": "新增頁面，無舊版可比較。"},
+                            "http_error_count": 0,
+                            "http_error_samples": [],
+                            "is_new_page": True,
+                        }
+                    )
+                except Exception:
+                    stats["skipped"] += 1
+                finally:
+                    new_rel_ref["value"] = None
+                    progress.update()
+
+            await browser.close()
+    except PlaywrightError as exc:
+        warning = f"Playwright failed; skipped page visual diff. {exc}"
+    finally:
+        old_server.stop()
+        new_server.stop()
+
+    return items, warning
+
+
 def generate_page_visual_diffs(
     old_root: Path,
     new_root: Path,
@@ -421,9 +1269,7 @@ def generate_page_visual_diffs(
             "skipped": 0,
             "http_error_pages": 0,
             "http_error_requests": 0,
-        }, (
-            "Playwright not installed; skipped page visual diff."
-        )
+        }, "Playwright not installed; skipped page visual diff."
 
     old_files = collect_files(old_root)
     new_files = collect_files(new_root)
@@ -432,10 +1278,18 @@ def generate_page_visual_diffs(
         for rel in sorted(set(old_files) & set(new_files))
         if Path(rel).suffix.lower() in {".html", ".htm"}
     ]
+    new_only = [
+        rel
+        for rel in sorted(set(new_files) - set(old_files))
+        if Path(rel).suffix.lower() in {".html", ".htm"}
+    ]
     if max_pages > 0:
         candidates = candidates[:max_pages]
+        remaining = max(0, max_pages - len(candidates))
+        new_only = new_only[:remaining]
 
-    if not candidates:
+    total_count = len(candidates) + len(new_only)
+    if total_count == 0:
         return [], {
             "total_candidates": 0,
             "compared": 0,
@@ -445,140 +1299,37 @@ def generate_page_visual_diffs(
             "http_error_requests": 0,
         }, None
 
-    old_server = LocalSnapshotServer(old_root)
-    new_server = LocalSnapshotServer(new_root)
-    old_server.start()
-    new_server.start()
-
-    items: List[Dict[str, object]] = []
-    stats = {
-        "total_candidates": len(candidates),
+    stats: Dict[str, int] = {
+        "total_candidates": total_count,
         "compared": 0,
         "changed": 0,
         "skipped": 0,
         "http_error_pages": 0,
         "http_error_requests": 0,
     }
-    progress = ProgressBar(total=len(candidates), enabled=show_progress, label="Rendering pages")
+    progress = ProgressBar(total=total_count, enabled=show_progress, label="Rendering pages")
+    items: List[Dict[str, object]] = []
     warning: Optional[str] = None
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PlaywrightError as exc:
-                message = str(exc)
-                if "Executable doesn't exist" not in message:
-                    raise
-                browser = None
-                for channel in ("msedge", "chrome"):
-                    try:
-                        browser = p.chromium.launch(headless=True, channel=channel)
-                        break
-                    except PlaywrightError:
-                        continue
-                if browser is None:
-                    warning = (
-                        "Playwright browser is missing. Install with "
-                        "`python -m playwright install chromium`, or ensure Edge/Chrome is installed."
-                    )
-                    return items, stats, warning
-            context = browser.new_context(
-                viewport={"width": max(200, viewport_width), "height": max(200, viewport_height)},
-                ignore_https_errors=True,
+        items, warning = asyncio.run(
+            _page_visual_diffs_async(
+                old_root=old_root,
+                new_root=new_root,
+                output_dir=output_dir,
+                candidates=candidates,
+                new_only=new_only,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+                wait_ms=wait_ms,
+                progress=progress,
+                stats=stats,
             )
-            page = context.new_page()
-            current_rel: Dict[str, Optional[str]] = {"value": None}
-            per_page_http_errors: Dict[str, Dict[str, object]] = {}
-
-            def on_response(response) -> None:
-                rel = current_rel.get("value")
-                if not rel:
-                    return
-                try:
-                    status = int(response.status)
-                except Exception:
-                    return
-                if status < 400:
-                    return
-                record = per_page_http_errors.setdefault(rel, {"count": 0, "samples": []})
-                record["count"] = int(record.get("count", 0)) + 1
-                samples = record.get("samples")
-                if isinstance(samples, list) and len(samples) < 5:
-                    samples.append(f"[{status}] {response.url}")
-
-            page.on("response", on_response)
-
-            for rel in candidates:
-                try:
-                    current_rel["value"] = rel
-                    quoted_rel = urllib.parse.quote(rel, safe="/")
-                    old_url = f"http://127.0.0.1:{old_server.port}/{quoted_rel}"
-                    new_url = f"http://127.0.0.1:{new_server.port}/{quoted_rel}"
-                    anchor = _safe_anchor(f"page::{rel}")
-                    old_preview = Path("assets") / f"{anchor}_page_old.png"
-                    new_preview = Path("assets") / f"{anchor}_page_new.png"
-                    overlay_preview = Path("assets") / f"{anchor}_page_overlay.png"
-
-                    page.goto(old_url, wait_until="networkidle", timeout=120000)
-                    page.wait_for_timeout(max(0, wait_ms))
-                    page.screenshot(path=str(output_dir / old_preview), full_page=True)
-
-                    page.goto(new_url, wait_until="networkidle", timeout=120000)
-                    page.wait_for_timeout(max(0, wait_ms))
-                    page.screenshot(path=str(output_dir / new_preview), full_page=True)
-
-                    stats["compared"] += 1
-                    old_hash = sha1_file(output_dir / old_preview)
-                    new_hash = sha1_file(output_dir / new_preview)
-                    error_info = per_page_http_errors.get(rel, {"count": 0, "samples": []})
-                    error_count = int(error_info.get("count", 0))
-                    error_samples = (
-                        error_info.get("samples", [])
-                        if isinstance(error_info.get("samples", []), list)
-                        else []
-                    )
-
-                    if error_count > 0:
-                        stats["http_error_pages"] += 1
-                        stats["http_error_requests"] += error_count
-
-                    if old_hash == new_hash:
-                        stats["skipped"] += 1
-                        continue
-
-                    metrics = _save_image_diff(
-                        output_dir / old_preview,
-                        output_dir / new_preview,
-                        output_dir / overlay_preview,
-                    )
-                    stats["changed"] += 1
-                    items.append(
-                        {
-                            "path": rel,
-                            "old_hash": old_hash[:10],
-                            "new_hash": new_hash[:10],
-                            "old_preview": old_preview.as_posix(),
-                            "new_preview": new_preview.as_posix(),
-                            "overlay_preview": overlay_preview.as_posix() if metrics else "",
-                            "metrics": metrics or {"note": "Pillow not installed; only screenshot compared."},
-                            "http_error_count": error_count,
-                            "http_error_samples": error_samples,
-                        }
-                    )
-                except Exception:
-                    stats["skipped"] += 1
-                finally:
-                    current_rel["value"] = None
-                    progress.update()
-
-            browser.close()
-    except PlaywrightError as exc:
+        )
+    except Exception as exc:
         warning = f"Playwright failed; skipped page visual diff. {exc}"
     finally:
         progress.finish()
-        old_server.stop()
-        new_server.stop()
 
     return items, stats, warning
 
@@ -595,6 +1346,7 @@ def generate_report(
     page_visual_width: int,
     page_visual_height: int,
     page_visual_wait_ms: int,
+    quick_mode: bool,
 ) -> Path:
     old_files = collect_files(old_root)
     new_files = collect_files(new_root)
@@ -609,6 +1361,8 @@ def generate_report(
         "removed": 0,
         "modified_text": 0,
         "modified_image": 0,
+        "skipped_text": 0,
+        "skipped_image": 0,
         "modified_page_visual": 0,
         "modified_other": 0,
         "unchanged": 0,
@@ -618,86 +1372,101 @@ def generate_report(
     other_items: List[Dict[str, object]] = []
     added_items: List[str] = []
     removed_items: List[str] = []
-    progress = ProgressBar(total=len(all_paths), enabled=show_progress, label="Comparing files")
+    if quick_mode:
+        common_paths = sorted(set(old_files) & set(new_files))
+        for rel in common_paths:
+            old_path = old_files[rel]
+            new_path = new_files[rel]
+            old_ext = old_path.suffix.lower()
+            new_ext = new_path.suffix.lower()
+            if old_ext in TEXT_EXTENSIONS and new_ext in TEXT_EXTENSIONS:
+                summary["skipped_text"] += 1
+            elif old_ext in IMAGE_EXTENSIONS and new_ext in IMAGE_EXTENSIONS:
+                summary["skipped_image"] += 1
+    else:
+        progress = ProgressBar(total=len(all_paths), enabled=show_progress, label="Comparing files")
+        for rel in all_paths:
+            try:
+                old_path = old_files.get(rel)
+                new_path = new_files.get(rel)
 
-    for rel in all_paths:
-        try:
-            old_path = old_files.get(rel)
-            new_path = new_files.get(rel)
+                if old_path is None and new_path is not None:
+                    summary["added"] += 1
+                    added_items.append(rel)
+                    continue
+                if new_path is None and old_path is not None:
+                    summary["removed"] += 1
+                    removed_items.append(rel)
+                    continue
+                if old_path is None or new_path is None:
+                    continue
 
-            if old_path is None and new_path is not None:
-                summary["added"] += 1
-                added_items.append(rel)
-                continue
-            if new_path is None and old_path is not None:
-                summary["removed"] += 1
-                removed_items.append(rel)
-                continue
-            if old_path is None or new_path is None:
-                continue
+                old_hash = sha1_file(old_path)
+                new_hash = sha1_file(new_path)
+                if old_hash == new_hash:
+                    summary["unchanged"] += 1
+                    continue
 
-            old_hash = sha1_file(old_path)
-            new_hash = sha1_file(new_path)
-            if old_hash == new_hash:
-                summary["unchanged"] += 1
-                continue
+                if is_text_file(old_path) and is_text_file(new_path):
+                    summary["modified_text"] += 1
+                    side_by_side = build_side_by_side_rows(
+                        old_file=old_path,
+                        new_file=new_path,
+                        context_lines=text_context_lines,
+                        max_rows=max_text_diff_lines,
+                    )
+                    text_items.append(
+                        {
+                            "path": rel,
+                            "old_hash": old_hash[:10],
+                            "new_hash": new_hash[:10],
+                            "rows": side_by_side["rows"],
+                            "truncated": side_by_side["truncated"],
+                            "change_stats": side_by_side["change_stats"],
+                        }
+                    )
+                    continue
 
-            if is_text_file(old_path) and is_text_file(new_path):
-                summary["modified_text"] += 1
-                side_by_side = build_side_by_side_rows(
-                    old_file=old_path,
-                    new_file=new_path,
-                    context_lines=text_context_lines,
-                    max_rows=max_text_diff_lines,
-                )
-                text_items.append(
+                if is_image_file(old_path) and is_image_file(new_path):
+                    summary["modified_image"] += 1
+                    anchor = _safe_anchor(rel)
+                    old_preview = Path("assets") / f"{anchor}_old{old_path.suffix.lower() or '.bin'}"
+                    new_preview = Path("assets") / f"{anchor}_new{new_path.suffix.lower() or '.bin'}"
+                    overlay_preview = Path("assets") / f"{anchor}_overlay.png"
+
+                    _save_image_preview(old_path, output_dir / old_preview)
+                    _save_image_preview(new_path, output_dir / new_preview)
+                    metrics = _save_image_diff(old_path, new_path, output_dir / overlay_preview)
+
+                    image_items.append(
+                        {
+                            "path": rel,
+                            "old_hash": old_hash[:10],
+                            "new_hash": new_hash[:10],
+                            "old_preview": old_preview.as_posix(),
+                            "new_preview": new_preview.as_posix(),
+                            "overlay_preview": (
+                                overlay_preview.as_posix()
+                                if metrics
+                                and (output_dir / overlay_preview).exists()
+                                else ""
+                            ),
+                            "metrics": metrics or {"note": "Pillow not installed; only hash/preview compared."},
+                        }
+                    )
+                    continue
+
+                summary["modified_other"] += 1
+                other_items.append(
                     {
                         "path": rel,
                         "old_hash": old_hash[:10],
                         "new_hash": new_hash[:10],
-                        "rows": side_by_side["rows"],
-                        "truncated": side_by_side["truncated"],
-                        "change_stats": side_by_side["change_stats"],
                     }
                 )
-                continue
-
-            if is_image_file(old_path) and is_image_file(new_path):
-                summary["modified_image"] += 1
-                anchor = _safe_anchor(rel)
-                old_preview = Path("assets") / f"{anchor}_old{old_path.suffix.lower() or '.bin'}"
-                new_preview = Path("assets") / f"{anchor}_new{new_path.suffix.lower() or '.bin'}"
-                overlay_preview = Path("assets") / f"{anchor}_overlay.png"
-
-                _save_image_preview(old_path, output_dir / old_preview)
-                _save_image_preview(new_path, output_dir / new_preview)
-                metrics = _save_image_diff(old_path, new_path, output_dir / overlay_preview)
-
-                image_items.append(
-                    {
-                        "path": rel,
-                        "old_hash": old_hash[:10],
-                        "new_hash": new_hash[:10],
-                        "old_preview": old_preview.as_posix(),
-                        "new_preview": new_preview.as_posix(),
-                        "overlay_preview": overlay_preview.as_posix() if metrics else "",
-                        "metrics": metrics or {"note": "Pillow not installed; only hash/preview compared."},
-                    }
-                )
-                continue
-
-            summary["modified_other"] += 1
-            other_items.append(
-                {
-                    "path": rel,
-                    "old_hash": old_hash[:10],
-                    "new_hash": new_hash[:10],
-                }
-            )
-        finally:
-            progress.update()
-
-    progress.finish()
+            finally:
+                progress.update()
+        progress.finish()
 
     page_visual_items: List[Dict[str, object]] = []
     page_visual_stats = {
@@ -736,6 +1505,10 @@ def generate_report(
         "page_visual_items": page_visual_items,
         "page_visual_stats": page_visual_stats,
         "page_visual_warning": page_visual_warning or "",
+        "quick_mode": quick_mode,
+        "cache_token": str(int(time.time() * 1000)),
+        "pil_available": PIL_AVAILABLE,
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
     }
     (output_dir / "report.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -747,17 +1520,39 @@ def generate_report(
     return report_file
 
 
-def _render_summary_card(summary: Dict[str, int]) -> str:
+def _render_summary_card(summary: Dict[str, int], quick_mode: bool) -> str:
     parts = []
-    for key, label, anchor in [
-        ("added", "新增", "section-added"),
-        ("removed", "刪除", "section-removed"),
-        ("modified_text", "文字異動", "section-text"),
-        ("modified_image", "圖片異動", "section-image"),
-        ("modified_page_visual", "頁面視覺異動", "section-page-visual"),
-        ("modified_other", "其他異動", "section-other"),
-        ("unchanged", "未變更", "section-unchanged"),
-    ]:
+    card_defs = []
+    if not quick_mode:
+        card_defs.extend(
+            [
+                ("added", "新增", "section-added"),
+                ("removed", "刪除", "section-removed"),
+            ]
+        )
+    if quick_mode:
+        card_defs.extend(
+            [
+                ("skipped_text", "略過文字", "section-skip"),
+                ("skipped_image", "略過圖片", "section-skip"),
+            ]
+        )
+    else:
+        card_defs.extend(
+            [
+                ("modified_text", "文字異動", "section-text"),
+                ("modified_image", "圖片異動", "section-image"),
+            ]
+        )
+    card_defs.extend(
+        [("modified_page_visual", "頁面視覺異動", "section-page-visual")]
+    )
+    if not quick_mode:
+        card_defs.append(("modified_other", "其他異動", "section-other"))
+    if not quick_mode:
+        card_defs.append(("unchanged", "未變更", "section-unchanged"))
+
+    for key, label, anchor in card_defs:
         parts.append(
             "<a class='metric metric-link' href='#"
             + anchor
@@ -828,11 +1623,13 @@ def _render_text_items(items: Sequence[Dict[str, object]]) -> str:
     return "\n".join(chunks)
 
 
-def _render_image_items(items: Sequence[Dict[str, object]]) -> str:
+def _render_image_items(items: Sequence[Dict[str, object]], cache_token: str) -> str:
     if not items:
         return "<p class='empty'>沒有偵測到圖片異動。</p>"
     chunks: List[str] = []
     for item in items:
+        item_path = str(item["path"])
+        item_path_escaped = html.escape(item_path)
         metrics_json = html.escape(
             json.dumps(item.get("metrics", {}), ensure_ascii=False, indent=2)
         )
@@ -846,17 +1643,23 @@ def _render_image_items(items: Sequence[Dict[str, object]]) -> str:
         )
         overlay = item.get("overlay_preview") or ""
         overlay_block = (
-            f"<div><h4>差異高亮</h4><img src='{html.escape(str(overlay))}' alt='overlay'></div>"
+            "<div class='img-panel'><h4>差異框選（紅框：共同區域差異；橘區：僅新版；藍區：僅舊版）</h4>"
+            f"<img class='preview-img js-zoomable' src='{_asset_src(str(overlay), cache_token)}' "
+            f"alt='overlay' data-caption='{html.escape(f'{item_path} - 差異遮罩', quote=True)}'></div>"
             if overlay
-            else "<div><h4>差異高亮</h4><p class='empty'>未產生（請安裝 Pillow）</p></div>"
+            else "<div><h4>差異高亮</h4><p class='empty'>未產生（可能為尺寸不同或未安裝 Pillow）</p></div>"
         )
         chunks.append(
             "<details class='card'>"
-            f"<summary><code>{html.escape(str(item['path']))}</code> "
+            f"<summary><code>{item_path_escaped}</code> "
             f"<span class='hash'>[{item['old_hash']} -> {item['new_hash']}]</span></summary>"
             "<div class='img-grid'>"
-            f"<div><h4>舊版</h4><img src='{html.escape(str(item['old_preview']))}' alt='old'></div>"
-            f"<div><h4>新版</h4><img src='{html.escape(str(item['new_preview']))}' alt='new'></div>"
+            "<div class='img-panel'><h4>舊版</h4>"
+            f"<img class='preview-img js-zoomable' src='{_asset_src(str(item['old_preview']), cache_token)}' "
+            f"alt='old' data-caption='{html.escape(f'{item_path} - 舊版', quote=True)}'></div>"
+            "<div class='img-panel'><h4>新版</h4>"
+            f"<img class='preview-img js-zoomable' src='{_asset_src(str(item['new_preview']), cache_token)}' "
+            f"alt='new' data-caption='{html.escape(f'{item_path} - 新版', quote=True)}'></div>"
             f"{overlay_block}"
             "</div>"
             f"<pre>{metrics_json}</pre>"
@@ -869,6 +1672,7 @@ def _render_page_visual_items(
     items: Sequence[Dict[str, object]],
     stats: Dict[str, object],
     warning: str,
+    cache_token: str,
 ) -> str:
     stat_text = (
         f"<p class='meta-inline'>候選頁面：{int(stats.get('total_candidates', 0))}，"
@@ -886,6 +1690,9 @@ def _render_page_visual_items(
 
     chunks: List[str] = [stat_text]
     for item in items:
+        item_path = str(item["path"])
+        item_path_escaped = html.escape(item_path)
+        is_new_page = bool(item.get("is_new_page", False))
         metrics_json = html.escape(
             json.dumps(item.get("metrics", {}), ensure_ascii=False, indent=2)
         )
@@ -898,25 +1705,56 @@ def _render_page_visual_items(
             else ""
         )
         overlay = item.get("overlay_preview") or ""
-        overlay_block = (
-            f"<div><h4>差異高亮</h4><img src='{html.escape(str(overlay))}' alt='overlay'></div>"
-            if overlay
-            else "<div><h4>差異高亮</h4><p class='empty'>未產生（請安裝 Pillow）</p></div>"
-        )
-        chunks.append(
-            "<details class='card'>"
-            f"<summary><code>{html.escape(str(item['path']))}</code> "
-            f"<span class='hash'>[{item['old_hash']} -> {item['new_hash']}]</span>"
-            f" <span class='chip chip-del'>fail {int(item.get('http_error_count', 0))}</span></summary>"
-            "<div class='img-grid page-grid'>"
-            f"<div><h4>舊版畫面</h4><img src='{html.escape(str(item['old_preview']))}' alt='old-page'></div>"
-            f"<div><h4>新版畫面</h4><img src='{html.escape(str(item['new_preview']))}' alt='new-page'></div>"
-            f"{overlay_block}"
-            "</div>"
-            f"{error_block}"
-            f"<pre>{metrics_json}</pre>"
-            "</details>"
-        )
+        old_overlay = item.get("old_overlay_preview") or ""
+
+        if is_new_page:
+            # New-only page: show only new version screenshot, no comparison.
+            new_img_src = _asset_src(str(item.get("new_preview", "")), cache_token)
+            summary_badge = "<span class='chip chip-ins'>新增頁面</span>"
+            chunks.append(
+                "<details class='card'>"
+                f"<summary><code>{item_path_escaped}</code> "
+                f"{summary_badge}</summary>"
+                "<div class='img-grid page-grid'>"
+                "<div class='img-panel'><h4>新版畫面（僅新版存在）</h4>"
+                f"<img class='preview-img js-zoomable' src='{new_img_src}' "
+                f"alt='new-page' data-caption='{html.escape(f'{item_path} - 新版畫面', quote=True)}'></div>"
+                "</div>"
+                f"<pre>{metrics_json}</pre>"
+                "</details>"
+            )
+        else:
+            fail_chip = (
+                f" <span class='chip chip-del'>fail {int(item.get('http_error_count', 0))}</span>"
+                if int(item.get("http_error_count", 0)) > 0
+                else ""
+            )
+            # Choose annotated images when available, fall back to raw screenshots.
+            old_src = _asset_src(old_overlay or str(item["old_preview"]), cache_token)
+            old_label = "舊版畫面（紅框：已刪除內容）" if old_overlay else "舊版畫面"
+            old_caption = html.escape(f'{item_path} - 舊版畫面', quote=True)
+
+            new_src = _asset_src(overlay or str(item["new_preview"]), cache_token)
+            new_label = "新版畫面（橘框：新增／異動內容）" if overlay else "新版畫面"
+            new_caption = html.escape(f'{item_path} - 新版畫面', quote=True)
+
+            chunks.append(
+                "<details class='card'>"
+                f"<summary><code>{item_path_escaped}</code> "
+                f"<span class='hash'>[{item['old_hash']} -> {item['new_hash']}]</span>"
+                f"{fail_chip}</summary>"
+                "<div class='img-grid page-grid'>"
+                f"<div class='img-panel'><h4>{old_label}</h4>"
+                f"<img class='preview-img js-zoomable' src='{old_src}' "
+                f"alt='old-page' data-caption='{old_caption}'></div>"
+                f"<div class='img-panel'><h4>{new_label}</h4>"
+                f"<img class='preview-img js-zoomable' src='{new_src}' "
+                f"alt='new-page' data-caption='{new_caption}'></div>"
+                "</div>"
+                f"{error_block}"
+                f"<pre>{metrics_json}</pre>"
+                "</details>"
+            )
     return "\n".join(chunks)
 
 
@@ -940,18 +1778,128 @@ def _render_other_items(items: Sequence[Dict[str, object]]) -> str:
     return f"<ul>{li}</ul>"
 
 
+def _render_dependency_banner(pil_ok: bool, playwright_ok: bool) -> str:
+    if pil_ok and playwright_ok:
+        return ""
+    items: List[str] = []
+    if not pil_ok:
+        items.append(
+            "<li>"
+            "<strong>Pillow</strong>（圖片差異框選 / 像素比對）未安裝。"
+            " 安裝指令：<code>pip install pillow</code>"
+            "</li>"
+        )
+    if not playwright_ok:
+        items.append(
+            "<li>"
+            "<strong>Playwright</strong>（頁面截圖視覺比對）未安裝。"
+            " 安裝指令：<code>pip install playwright</code>"
+            "，接著執行 <code>python -m playwright install chromium</code>"
+            "</li>"
+        )
+    return (
+        "<div class='dep-banner'>"
+        "<strong>⚠ 缺少相依套件，以下功能已停用：</strong>"
+        f"<ul>{''.join(items)}</ul>"
+        "</div>"
+    )
+
+
 def render_html(payload: Dict[str, object]) -> str:
-    summary_html = _render_summary_card(payload["summary"])  # type: ignore[index]
-    text_html = _render_text_items(payload["text_items"])  # type: ignore[index]
-    image_html = _render_image_items(payload["image_items"])  # type: ignore[index]
+    quick_mode = bool(payload.get("quick_mode", False))
+    cache_token = str(payload.get("cache_token", "0"))
+    dep_banner_html = _render_dependency_banner(
+        pil_ok=bool(payload.get("pil_available", True)),
+        playwright_ok=bool(payload.get("playwright_available", True)),
+    )
+    summary_html = _render_summary_card(payload["summary"], quick_mode=quick_mode)  # type: ignore[index]
+    text_html = _render_text_items(payload["text_items"]) if not quick_mode else ""
+    image_html = _render_image_items(payload["image_items"], cache_token=cache_token) if not quick_mode else ""
     page_visual_html = _render_page_visual_items(
         payload.get("page_visual_items", []),  # type: ignore[arg-type]
         payload.get("page_visual_stats", {}),  # type: ignore[arg-type]
         str(payload.get("page_visual_warning", "")),
+        cache_token=cache_token,
     )
     other_html = _render_other_items(payload["other_items"])  # type: ignore[index]
     added_html = _render_simple_list(payload["added_items"], "沒有新增檔案。")  # type: ignore[index]
     removed_html = _render_simple_list(payload["removed_items"], "沒有刪除檔案。")  # type: ignore[index]
+    skip_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-skip">'
+            "<h2>快速模式略過項目</h2>"
+            "<p>目前啟用快速模式，已略過以下詳細比對，以加快整體速度：</p>"
+            "<ul>"
+            f"<li>文字異動：<strong>{payload['summary'].get('skipped_text', 0)}</strong> 個檔案</li>"
+            f"<li>圖片異動：<strong>{payload['summary'].get('skipped_image', 0)}</strong> 個檔案</li>"
+            "</ul>"
+            "<p class='hint'>若要完整報告，請改用 <code>--full-report</code>。</p>"
+            "</section>"
+        )
+        if quick_mode
+        else ""
+    )
+    text_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-text">'
+            "<h2>文字異動</h2>"
+            f"{text_html}"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
+    image_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-image">'
+            "<h2>圖片異動</h2>"
+            '<p class="hint">可點擊任一圖片放大檢視，按 Esc 或點背景關閉。</p>'
+            f"{image_html}"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
+    other_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-other">'
+            "<h2>其他二進位檔異動</h2>"
+            f"{other_html}"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
+    added_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-added">'
+            "<h2>新增檔案</h2>"
+            f"{added_html}"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
+    removed_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-removed">'
+            "<h2>刪除檔案</h2>"
+            f"{removed_html}"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
+    unchanged_section_html = (
+        (
+            '<section class="section anchor-offset" id="section-unchanged">'
+            "<h2>未變更統計</h2>"
+            f"<p>未變更檔案數：<strong>{payload['summary'].get('unchanged', 0)}</strong></p>"
+            "</section>"
+        )
+        if not quick_mode
+        else ""
+    )
 
     return f"""<!doctype html>
 <html lang="zh-Hant">
@@ -1007,6 +1955,28 @@ def render_html(payload: Dict[str, object]) -> str:
       border-radius: 6px;
       padding: 8px 10px;
       margin: 10px 0;
+    }}
+    .dep-banner {{
+      background: #fff3cd;
+      color: #5a3e00;
+      border: 1px solid #f5c842;
+      border-left: 5px solid #f0a500;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 18px;
+      font-size: 14px;
+    }}
+    .dep-banner ul {{
+      margin: 6px 0 0 0;
+      padding-left: 20px;
+    }}
+    .dep-banner li {{
+      margin: 4px 0;
+    }}
+    .dep-banner code {{
+      background: #ffeaa0;
+      border-radius: 3px;
+      padding: 1px 5px;
     }}
     .section {{
       margin: 18px 0;
@@ -1094,18 +2064,86 @@ def render_html(payload: Dict[str, object]) -> str:
     .muted {{ color: #8c92a8; font-style: italic; }}
     .img-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
       gap: 12px;
       margin-top: 8px;
     }}
+    .img-panel h4 {{
+      margin: 0 0 6px;
+      color: #4f5670;
+      font-size: 13px;
+    }}
+    .preview-img {{
+      width: 100%;
+      height: auto;
+      display: block;
+      cursor: zoom-in;
+    }}
     .img-grid img {{
-      max-width: 100%;
       border: 1px solid #dce1ef;
       border-radius: 6px;
       background: white;
     }}
+    .page-grid {{
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    }}
     .page-grid img {{
       box-shadow: 0 1px 8px rgba(13, 25, 64, 0.12);
+    }}
+    .lightbox {{
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 8, 22, 0.86);
+      z-index: 9999;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 24px 18px;
+      overflow-y: auto;
+    }}
+    .lightbox[hidden] {{
+      display: none;
+    }}
+    .lightbox-content {{
+      width: min(96vw, 1080px);
+      flex-shrink: 0;
+      margin: 0;
+      position: relative;
+    }}
+    .lightbox img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid #2f3854;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+      background: #fff;
+    }}
+    .lightbox figcaption {{
+      color: #d6dcef;
+      margin-top: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+      word-break: break-word;
+    }}
+    .lightbox-close {{
+      position: absolute;
+      top: -12px;
+      right: -12px;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid #6d789c;
+      background: #1a233d;
+      color: #fff;
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+    }}
+    .hint {{
+      margin: 8px 0 0;
+      color: #6f7690;
+      font-size: 12px;
     }}
     .empty {{ color: #6f7690; }}
     html {{
@@ -1124,42 +2162,76 @@ def render_html(payload: Dict[str, object]) -> str:
     新版：<code>{html.escape(str(payload["new_root"]))}</code>
   </div>
 
+  {dep_banner_html}
+
   <div class="metrics">{summary_html}</div>
 
-  <section class="section anchor-offset" id="section-text">
-    <h2>文字異動</h2>
-    {text_html}
-  </section>
+  {skip_section_html}
 
-  <section class="section anchor-offset" id="section-image">
-    <h2>圖片異動</h2>
-    {image_html}
-  </section>
+  {text_section_html}
+
+  {image_section_html}
 
   <section class="section anchor-offset" id="section-page-visual">
     <h2>頁面視覺異動（左右畫面比較）</h2>
+    <p class="hint">可點擊任一圖片放大檢視，按 Esc 或點背景關閉。</p>
     {page_visual_html}
   </section>
 
-  <section class="section anchor-offset" id="section-other">
-    <h2>其他二進位檔異動</h2>
-    {other_html}
-  </section>
+  {other_section_html}
 
-  <section class="section anchor-offset" id="section-added">
-    <h2>新增檔案</h2>
-    {added_html}
-  </section>
+  {added_section_html}
 
-  <section class="section anchor-offset" id="section-removed">
-    <h2>刪除檔案</h2>
-    {removed_html}
-  </section>
+  {removed_section_html}
 
-  <section class="section anchor-offset" id="section-unchanged">
-    <h2>未變更統計</h2>
-    <p>未變更檔案數：<strong>{payload["summary"].get("unchanged", 0)}</strong></p>
-  </section>
+  {unchanged_section_html}
+
+  <div class="lightbox" id="image-lightbox" hidden>
+    <figure class="lightbox-content">
+      <button class="lightbox-close" type="button" aria-label="關閉">×</button>
+      <img id="lightbox-image" src="" alt="preview">
+      <figcaption id="lightbox-caption"></figcaption>
+    </figure>
+  </div>
+  <script>
+    (function () {{
+      var lightbox = document.getElementById("image-lightbox");
+      var lightboxImage = document.getElementById("lightbox-image");
+      var lightboxCaption = document.getElementById("lightbox-caption");
+      var closeButton = lightbox.querySelector(".lightbox-close");
+      function closeLightbox() {{
+        lightbox.hidden = true;
+        lightboxImage.src = "";
+        lightboxCaption.textContent = "";
+      }}
+      function openLightbox(src, caption) {{
+        lightboxImage.src = src;
+        lightboxCaption.textContent = caption || "";
+        lightbox.hidden = false;
+      }}
+      document.querySelectorAll(".js-zoomable").forEach(function (img) {{
+        img.addEventListener("click", function () {{
+          var src = img.getAttribute("src");
+          var caption = img.getAttribute("data-caption") || "";
+          if (!src) {{
+            return;
+          }}
+          openLightbox(src, caption);
+        }});
+      }});
+      closeButton.addEventListener("click", closeLightbox);
+      lightbox.addEventListener("click", function (event) {{
+        if (event.target === lightbox) {{
+          closeLightbox();
+        }}
+      }});
+      document.addEventListener("keydown", function (event) {{
+        if (event.key === "Escape" && !lightbox.hidden) {{
+          closeLightbox();
+        }}
+      }});
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -1220,8 +2292,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--visual-wait-ms",
         type=int,
-        default=800,
-        help="Extra wait time after each page load in ms (default: 800).",
+        default=200,
+        help="Extra wait time after each page load in ms (default: 200).",
+    )
+    parser.add_argument(
+        "--full-report",
+        action="store_true",
+        help="Enable full text/image diff sections (default is quick mode).",
     )
     return parser.parse_args()
 
@@ -1249,6 +2326,7 @@ def main() -> None:
         page_visual_width=max(200, args.visual_width),
         page_visual_height=max(200, args.visual_height),
         page_visual_wait_ms=max(0, args.visual_wait_ms),
+        quick_mode=not args.full_report,
     )
 
     print(f"Done. Report generated: {report_file}")
