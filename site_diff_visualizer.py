@@ -581,30 +581,62 @@ def _save_image_diff(
     # those regions; everything that also exists in old is ignored.
     # Fallback: pixel diff, used only when Playwright text extraction returned
     # no data (e.g. the page was not loaded, JS execution failed, etc.).
+    def _overlaps_any(box: Tuple[int, int, int, int], boxes: List[Tuple[int, int, int, int]]) -> bool:
+        bl, bt, br, bb = box
+        return any(fl < br and fr > bl and ft < bb and fb > bt for fl, ft, fr, fb in boxes)
+
+    # Regions taller than this are considered "large" (multi-line blocks or
+    # containers).  They are only used for boxing when no smaller region
+    # already covers part of the same area, preventing a parent <li> or
+    # <div> from over-highlighting when only one child item changed.
+    _LARGE_H = 60
+
     if old_texts_set and new_texts_set:
-        new_raw: List[Tuple[int, int, int, int]] = [
+        # Phase 1: small, fine-grained regions (individual text lines).
+        new_raw_fine: List[Tuple[int, int, int, int]] = [
             (nl, nt, nr, nb)
             for text, (nl, nt, nr, nb) in new_regions_list
-            if len(text) >= MIN_LEN and text not in old_texts_set
+            if len(text) >= MIN_LEN
+            and text not in old_texts_set
+            and not text.startswith("\x01")
+            and (nb - nt) <= _LARGE_H
         ]
-        # Each entry in new_raw already carries the section-container bounding
-        # box (from _TEXT_REGION_JS getSectionRect), so a moderate merge gap is
-        # sufficient to combine overlapping container boxes without chaining
-        # through the whole page.
-        new_boxes = _merge_rect_list(new_raw, gap=60)
+        # Phase 2: large regions (tall block elements from Pass 2 AND Pass 3
+        # containers) — include only when no fine-grained new entry already
+        # covers part of the same area.
+        for text, (nl, nt, nr, nb) in new_regions_list:
+            if len(text) < MIN_LEN or text in old_texts_set:
+                continue
+            is_container = text.startswith("\x01")
+            is_large_block = (not is_container) and (nb - nt) > _LARGE_H
+            if not is_container and not is_large_block:
+                continue
+            if not _overlaps_any((nl, nt, nr, nb), new_raw_fine):
+                new_raw_fine.append((nl, nt, nr, nb))
+        new_boxes = _merge_rect_list(new_raw_fine, gap=15)
     else:
         # Pixel-diff fallback.
         mask = diff_luma.point(lambda x: 255 if x > 25 else 0)
         new_boxes = _build_diff_boxes(mask)
 
     # ── Deleted content boxes (old image) ────────────────────────────────────
+    # Only small, fine-grained entries (Phase 1) are used for deleted boxes.
+    # Large blocks / containers whose fingerprint merely changed (because
+    # items were added or reordered) are NOT marked as deleted — the content
+    # still exists in the new page, it was just modified.  If specific items
+    # were truly removed, they appear as individual small entries.
     if old_texts_set and new_texts_set:
-        del_raw: List[Tuple[int, int, int, int]] = [
-            (ol, ot, or_, ob)
-            for text, (ol, ot, or_, ob) in old_regions_list
-            if len(text) >= MIN_LEN and text not in new_texts_set
-        ]
-        deleted_boxes = _merge_rect_list(del_raw, gap=60)
+        deleted_boxes = _merge_rect_list(
+            [
+                (ol, ot, or_, ob)
+                for text, (ol, ot, or_, ob) in old_regions_list
+                if len(text) >= MIN_LEN
+                and text not in new_texts_set
+                and not text.startswith("\x01")
+                and (ob - ot) <= _LARGE_H
+            ],
+            gap=15,
+        )
     else:
         deleted_boxes = []
 
@@ -787,10 +819,21 @@ class LocalSnapshotServer:
 _TEXT_REGION_JS = """() => {
     const out = [];
     const seen = new Set();
+    const sx = window.scrollX || window.pageXOffset || 0;
+    const sy = window.scrollY || window.pageYOffset || 0;
 
     function isHidden(el) {
         const s = window.getComputedStyle(el);
         return s.display === "none" || s.visibility === "hidden" || Number(s.opacity || "1") === 0;
+    }
+
+    function toDocRect(rect) {
+        return {
+            left: Math.round(rect.left + sx),
+            top: Math.round(rect.top + sy),
+            right: Math.round(rect.right + sx),
+            bottom: Math.round(rect.bottom + sy),
+        };
     }
 
     // Pass 1: text nodes (2–100 chars) — fine-grained tokens for matching.
@@ -814,16 +857,11 @@ _TEXT_REGION_JS = """() => {
             node = walker.nextNode();
             continue;
         }
-        const key = text + "|" + Math.round(rect.left) + "|" + Math.round(rect.top);
+        const dr = toDocRect(rect);
+        const key = text + "|" + dr.left + "|" + dr.top;
         if (!seen.has(key)) {
             seen.add(key);
-            out.push({
-                text,
-                left: Math.round(rect.left),
-                top: Math.round(rect.top),
-                right: Math.round(rect.right),
-                bottom: Math.round(rect.bottom),
-            });
+            out.push({ text, ...dr });
         }
         node = walker.nextNode();
     }
@@ -839,26 +877,19 @@ _TEXT_REGION_JS = """() => {
             const fingerprint = text.slice(0, 120);
             const rect = el.getBoundingClientRect();
             if (!rect || rect.width < 20 || rect.height < 8) continue;
-            const key = fingerprint + "|blk|" + Math.round(rect.left) + "|" + Math.round(rect.top);
+            const dr = toDocRect(rect);
+            const key = fingerprint + "|blk|" + dr.left + "|" + dr.top;
             if (!seen.has(key)) {
                 seen.add(key);
-                out.push({
-                    text: fingerprint,
-                    left: Math.round(rect.left),
-                    top: Math.round(rect.top),
-                    right: Math.round(rect.right),
-                    bottom: Math.round(rect.bottom),
-                });
+                out.push({ text: fingerprint, ...dr });
             }
         }
     }
 
     // Pass 3: section-level container elements (div / section / article / aside).
-    // Uses the container's *full* text content (first 120 chars) as a fingerprint
-    // and the container's bounding box as the visual region.  This is the key
-    // mechanism for highlighting an entire logical section (e.g. a note block
-    // with heading + list items) as a single box: if the container's content
-    // fingerprint is absent from the old page, the whole container gets boxed.
+    // These use large bounding boxes so they are ONLY used for text matching
+    // (recognising moved vs genuinely new content), NOT for building highlight
+    // boxes.  The \\x01 prefix lets Python distinguish them from Pass 1/2.
     //
     // Height range 20–800 px: lower bound 20 px captures single-line heading
     // widgets (Axure text rectangles are typically 25 px tall) while still
@@ -869,17 +900,12 @@ _TEXT_REGION_JS = """() => {
         if (!rect || rect.height < 20 || rect.height > 800 || rect.width < 80) continue;
         const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
         if (text.length < 10) continue;
-        const fingerprint = text.slice(0, 120);
+        const fingerprint = text.slice(0, 400);
         const key = "cnt|" + fingerprint;
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push({
-            text: fingerprint,
-            left: Math.round(rect.left),
-            top: Math.round(rect.top),
-            right: Math.round(rect.right),
-            bottom: Math.round(rect.bottom),
-        });
+        const dr = toDocRect(rect);
+        out.push({ text: "\\x01" + fingerprint, ...dr });
     }
 
     return out;
@@ -943,6 +969,7 @@ async def _unlock_full_page(page) -> None:
         # Resize viewport so that 100vh / height:100% elements expand fully.
         if w > 0 and h > 0:
             await page.set_viewport_size({"width": w, "height": h})
+            await page.evaluate("() => { window.scrollTo(0, 0); }")
             await page.evaluate("() => new Promise(r => requestAnimationFrame(r))")
     except Exception:
         pass
